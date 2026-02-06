@@ -1,10 +1,11 @@
+// File: main.go
 package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/manifoldco/promptui"
@@ -24,16 +25,16 @@ func main() {
 	fmt.Printf("Current directory: %s\n", currentDir)
 
 	// Get all directories in the current directory
-	dirs, err := ioutil.ReadDir(currentDir)
+	entries, err := os.ReadDir(currentDir)
 	if err != nil {
 		fmt.Printf("Error reading current directory: %v\n", err)
 		os.Exit(1)
 	}
 
 	var availableDirs []string
-	for _, dir := range dirs {
-		if dir.IsDir() {
-			availableDirs = append(availableDirs, dir.Name())
+	for _, entry := range entries {
+		if entry.IsDir() {
+			availableDirs = append(availableDirs, entry.Name())
 		}
 	}
 
@@ -49,17 +50,21 @@ func main() {
 		return
 	}
 
-	// Ask for file extensions
-	fmt.Println() // Add a newline before asking for extensions
+	// Ask for file extensions with wildcard support
+	fmt.Println()
 	extensions := selectExtensions()
-	if len(extensions) == 0 {
-		fmt.Println("No extensions selected. Exiting.")
+	if extensions == nil {
+		fmt.Println("Selection cancelled. Exiting.")
 		return
 	}
 
+	// Ask for max file size limit
+	fmt.Println()
+	maxSizeKB := selectMaxFileSize()
+
 	// Process selected directories
 	outputFile := filepath.Join(currentDir, "accumulated_files.txt")
-	err = processDirectories(selectedDirs, extensions, outputFile)
+	err = processDirectories(selectedDirs, extensions, maxSizeKB, outputFile)
 	if err != nil {
 		fmt.Printf("Error processing directories: %v\n", err)
 		os.Exit(1)
@@ -94,19 +99,12 @@ func selectDirectoriesInteractive(dirs []string) []string {
 
 	// Create a multi-select prompt
 	selectedDirs := []string{}
+	label := "Select directories to process (↑↓ to navigate, Enter to toggle selection)"
 
-	// Create a label to show current selections
-	label := "Select directories to process (Use UP/DOWN to navigate, ENTER to select/deselect, 'f' to finish)"
-
-	// Use a loop to allow multiple selections
 	for {
-		// Create a copy of the directory list with selection indicators
+		// Create display items with checkboxes
 		displayItems := make([]string, len(allDirs))
 		for i, dir := range allDirs {
-			if dir == "." {
-				dir = "."
-			}
-
 			selected := false
 			for _, sel := range selectedDirs {
 				if sel == dir {
@@ -121,39 +119,41 @@ func selectDirectoriesInteractive(dirs []string) []string {
 			}
 		}
 
-		// Add option to finish selection
+		// Add finish option at the end
 		displayItems = append(displayItems, ">>> FINISH SELECTION <<<")
 
 		prompt := promptui.Select{
-			Label: label,
-			Items: displayItems,
-			Stdout: &BellSkipper{}, // Disable sound
+			Label:  label,
+			Items:  displayItems,
+			Stdout: &BellSkipper{},
 			Templates: &promptui.SelectTemplates{
 				Active:   `{{ ">" | green }} {{ . }}`,
 				Inactive: `  {{ . }}`,
 				Selected: `{{ . }}`,
 			},
+			// IMPORTANT: Removed invalid Keys field to fix compilation error
 		}
 
 		_, result, err := prompt.Run()
 		if err != nil {
-			fmt.Printf("Prompt failed %v\n", err)
+			if err == promptui.ErrInterrupt {
+				fmt.Println("\nSelection cancelled by user.")
+				os.Exit(0)
+			}
+			fmt.Printf("Prompt failed: %v\n", err)
 			return nil
 		}
 
 		// Check if user wants to finish selection
 		if result == ">>> FINISH SELECTION <<<" {
+			if len(selectedDirs) == 0 {
+				fmt.Println("⚠ No directories selected. Continuing anyway...")
+			}
 			break
 		}
 
-		// Extract the actual directory name (remove the checkbox)
-		dirName := strings.TrimPrefix(result, "[x] ")
-		dirName = strings.TrimPrefix(dirName, "[ ] ")
-
-		// Convert back to actual directory name
-		if dirName == "." {
-			dirName = "."
-		}
+		// Extract the actual directory name (remove the checkbox prefix)
+		dirName := strings.TrimPrefix(strings.TrimPrefix(result, "[x] "), "[ ] ")
 
 		// Toggle selection
 		foundIndex := -1
@@ -172,11 +172,11 @@ func selectDirectoriesInteractive(dirs []string) []string {
 			selectedDirs = append(selectedDirs, dirName)
 		}
 
-		// Update label to show current count
+		// Update label to show current selection count
 		if len(selectedDirs) > 0 {
-			label = fmt.Sprintf("Selected %d directories - Use UP/DOWN to navigate, ENTER to select/deselect, 'f' to finish", len(selectedDirs))
+			label = fmt.Sprintf("✓ %d directories selected (↑↓ to navigate, Enter to toggle, choose 'FINISH' when done)", len(selectedDirs))
 		} else {
-			label = "Select directories to process (Use UP/DOWN to navigate, ENTER to select/deselect, 'f' to finish)"
+			label = "Select directories to process (↑↓ to navigate, Enter to toggle selection)"
 		}
 	}
 
@@ -184,23 +184,35 @@ func selectDirectoriesInteractive(dirs []string) []string {
 }
 
 func selectExtensions() []string {
-	// Use a prompt to get file extensions
 	prompt := promptui.Prompt{
-		Label: "Enter file extensions to accumulate (comma-separated, e.g., ts,dart,json), or press Enter for all files",
+		Label: "Enter file extensions (comma-separated, e.g., ts,dart,json) or '*' for all files",
+		Validate: func(input string) error {
+			input = strings.TrimSpace(input)
+			if input == "" {
+				return fmt.Errorf("input cannot be empty - enter '*' for all files or specify extensions")
+			}
+			return nil
+		},
 	}
 
 	result, err := prompt.Run()
 	if err != nil {
-		fmt.Printf("Prompt failed %v\n", err)
+		if err == promptui.ErrInterrupt {
+			return nil
+		}
+		fmt.Printf("Prompt failed: %v\n", err)
 		return nil
 	}
 
-	if result == "" {
-		// Return empty slice to indicate all files
-		return []string{}
+	result = strings.TrimSpace(result)
+
+	// Handle wildcard for all file types
+	if result == "*" {
+		fmt.Println("✓ Wildcard '*' selected: ALL file types will be included")
+		return []string{} // Empty slice = process all files
 	}
 
-	// Split and clean extensions
+	// Process comma-separated extensions
 	extList := strings.Split(result, ",")
 	var extensions []string
 
@@ -225,10 +237,49 @@ func selectExtensions() []string {
 		}
 	}
 
+	if len(resultSlice) > 0 {
+		fmt.Printf("✓ Selected extensions: %s\n", strings.Join(resultSlice, ", "))
+	} else {
+		fmt.Println("⚠ No valid extensions specified - will process all files")
+	}
 	return resultSlice
 }
 
-func processDirectories(dirs []string, extensions []string, outputFile string) error {
+func selectMaxFileSize() int64 {
+	prompt := promptui.Prompt{
+		Label:   "Maximum file size to include (in KB, 0 = no limit)",
+		Default: "0",
+		Validate: func(input string) error {
+			size, err := strconv.ParseInt(strings.TrimSpace(input), 10, 64)
+			if err != nil {
+				return fmt.Errorf("please enter a valid number")
+			}
+			if size < 0 {
+				return fmt.Errorf("size cannot be negative")
+			}
+			return nil
+		},
+	}
+
+	result, err := prompt.Run()
+	if err != nil {
+		if err == promptui.ErrInterrupt {
+			os.Exit(0)
+		}
+		fmt.Printf("Prompt failed: %v\n", err)
+		return 0
+	}
+
+	sizeKB, _ := strconv.ParseInt(strings.TrimSpace(result), 10, 64)
+	if sizeKB > 0 {
+		fmt.Printf("✓ Files larger than %d KB will be skipped\n", sizeKB)
+	} else {
+		fmt.Println("✓ No size limit (all files will be included)")
+	}
+	return sizeKB
+}
+
+func processDirectories(dirs []string, extensions []string, maxSizeKB int64, outputFile string) error {
 	// Create or clear the output file
 	outputFileHandle, err := os.Create(outputFile)
 	if err != nil {
@@ -237,60 +288,76 @@ func processDirectories(dirs []string, extensions []string, outputFile string) e
 	defer outputFileHandle.Close()
 
 	fileCount := 0
+	skippedSize := 0
+	skippedExt := 0
+	totalSize := int64(0)
 
 	// Process each selected directory
 	for _, dir := range dirs {
-		fmt.Printf("\nProcessing directory: %s\n", dir)
+		fmt.Printf("\n📁 Processing directory: %s\n", dir)
 
 		// Walk through the directory tree
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				// Skip inaccessible files/directories
+				fmt.Printf("  ⚠ Skipped (inaccessible): %s\n", path)
 				return nil
 			}
 
-			if !info.IsDir() {
-				// Check if file has one of the selected extensions (or if extensions is empty - meaning all files)
-				shouldProcess := len(extensions) == 0 // If no extensions specified, process all files
-				if !shouldProcess {
-					ext := strings.ToLower(filepath.Ext(path))
-					for _, allowedExt := range extensions {
-						if ext == allowedExt {
-							shouldProcess = true
-							break
-						}
-					}
-				}
+			// Skip directories
+			if info.IsDir() {
+				return nil
+			}
 
-				if shouldProcess {
-					// Read file content
-					content, err := ioutil.ReadFile(path)
-					if err != nil {
-						fmt.Printf("Error reading file %s: %v\n", path, err)
-						return nil
-					}
-
-					// Write header and content to output file
-					_, err = outputFileHandle.WriteString(fmt.Sprintf("// File: %s\n", path))
-					if err != nil {
-						return err
-					}
-
-					_, err = outputFileHandle.WriteString(string(content))
-					if err != nil {
-						return err
-					}
-
-					_, err = outputFileHandle.WriteString("\n\n//------------------------------------------------------------------------------\n\n")
-					if err != nil {
-						return err
-					}
-
-					fileCount++
-					fmt.Printf("Processed: %s\n", path)
+			// Check file size limit first (fast check)
+			if maxSizeKB > 0 {
+				fileSizeKB := info.Size() / 1024
+				if fileSizeKB > maxSizeKB {
+					fmt.Printf("  ⚠ Skipped (size: %d KB > limit %d KB): %s\n", fileSizeKB, maxSizeKB, path)
+					skippedSize++
+					return nil
 				}
 			}
 
+			// Check file extension
+			shouldProcess := len(extensions) == 0 // Empty = all files
+			if !shouldProcess {
+				ext := strings.ToLower(filepath.Ext(path))
+				for _, allowedExt := range extensions {
+					if ext == allowedExt {
+						shouldProcess = true
+						break
+					}
+				}
+			}
+
+			if !shouldProcess {
+				skippedExt++
+				return nil
+			}
+
+			// Read file content
+			content, err := os.ReadFile(path)
+			if err != nil {
+				fmt.Printf("  ⚠ Error reading file %s: %v\n", path, err)
+				return nil
+			}
+
+			// Write header and content to output file
+			header := fmt.Sprintf("// File: %s (%d bytes)\n", path, info.Size())
+			if _, err := outputFileHandle.WriteString(header); err != nil {
+				return err
+			}
+			if _, err := outputFileHandle.Write(content); err != nil {
+				return err
+			}
+			if _, err := outputFileHandle.WriteString("\n\n//------------------------------------------------------------------------------\n\n"); err != nil {
+				return err
+			}
+
+			fileCount++
+			totalSize += info.Size()
+			fmt.Printf("  ✓ %s (%d KB)\n", path, info.Size()/1024)
 			return nil
 		})
 
@@ -299,6 +366,14 @@ func processDirectories(dirs []string, extensions []string, outputFile string) e
 		}
 	}
 
-	fmt.Printf("\nTotal processed files: %d\n", fileCount)
+	// Print summary
+	fmt.Printf("\n" + strings.Repeat("=", 55))
+	fmt.Println("\n✅ ACCUMULATION COMPLETE")
+	fmt.Printf("   Processed files:  %d\n", fileCount)
+	fmt.Printf("   Skipped (size):   %d\n", skippedSize)
+	fmt.Printf("   Skipped (ext):    %d\n", skippedExt)
+	fmt.Printf("   Total size:       %.2f MB\n", float64(totalSize)/1024/1024)
+	fmt.Println(strings.Repeat("=", 55))
+
 	return nil
 }
