@@ -272,6 +272,12 @@ func selectMaxFileSize() int64 {
 }
 
 func processDirectories(dirs []string, extensions []string, maxSizeKB int64, outputFile string) error {
+	// Resolve absolute path of output file for accurate comparison
+	absOutputFile, err := filepath.Abs(outputFile)
+	if err != nil {
+		return fmt.Errorf("error resolving output file path: %v", err)
+	}
+
 	outputFileHandle, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("error creating output file: %v", err)
@@ -281,6 +287,7 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 	fileCount := 0
 	skippedSize := 0
 	skippedExt := 0
+	skippedOutput := 0 // Track skipped output files
 	totalSize := int64(0)
 
 	for _, dir := range dirs {
@@ -301,12 +308,25 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 				return nil
 			}
 
-			// Skip hidden files (starting with .) except .gitignore, .env, etc.
+			// EXPLICITLY EXCLUDE accumulated_files.txt (case-insensitive)
 			baseName := filepath.Base(path)
+			if strings.EqualFold(baseName, "accumulated_files.txt") {
+				skippedOutput++
+				return nil
+			}
+
+			// Skip hidden files (starting with .) except .gitignore, .env, etc.
 			if strings.HasPrefix(baseName, ".") && 
 			   baseName != ".gitignore" && 
 			   baseName != ".env" && 
 			   baseName != ".env.example" {
+				return nil
+			}
+
+			// Skip the output file itself (in case it exists before creation)
+			absPath, _ := filepath.Abs(path)
+			if absPath == absOutputFile {
+				skippedOutput++
 				return nil
 			}
 
@@ -369,10 +389,11 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 	// Final summary
 	fmt.Printf("\n" + strings.Repeat("=", 55))
 	fmt.Println("\n✅ ACCUMULATION COMPLETE")
-	fmt.Printf("   Processed files:  %d\n", fileCount)
-	fmt.Printf("   Skipped (size):   %d\n", skippedSize)
-	fmt.Printf("   Skipped (ext):    %d\n", skippedExt)
-	fmt.Printf("   Total size:       %.2f MB\n", float64(totalSize)/1024/1024)
+	fmt.Printf("   Processed files:    %d\n", fileCount)
+	fmt.Printf("   Skipped (size):     %d\n", skippedSize)
+	fmt.Printf("   Skipped (ext):      %d\n", skippedExt)
+	fmt.Printf("   Skipped (output):   %d\n", skippedOutput) // Show excluded accumulation files
+	fmt.Printf("   Total size:         %.2f MB\n", float64(totalSize)/1024/1024)
 	fmt.Println(strings.Repeat("=", 55))
 
 	return nil
