@@ -24,7 +24,7 @@ func main() {
 
 	fmt.Printf("Current directory: %s\n", currentDir)
 
-	// Get all directories in the current directory
+	// Get all directories in the current directory (excluding hidden ones)
 	entries, err := os.ReadDir(currentDir)
 	if err != nil {
 		fmt.Printf("Error reading current directory: %v\n", err)
@@ -33,17 +33,13 @@ func main() {
 
 	var availableDirs []string
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
 			availableDirs = append(availableDirs, entry.Name())
 		}
 	}
 
-	if len(availableDirs) == 0 {
-		fmt.Println("No subdirectories found in current directory.")
-		return
-	}
-
-	// Ask user to select directories using interactive prompt
+	// ALWAYS include current directory as an option (even if no subdirs exist)
+	// Proceed to selection regardless of subdir count
 	selectedDirs := selectDirectoriesInteractive(availableDirs)
 	if len(selectedDirs) == 0 {
 		fmt.Println("No directories selected. Exiting.")
@@ -58,7 +54,7 @@ func main() {
 		return
 	}
 
-	// Ask for max file size limit
+	// Ask for max file size limit (default 10 KB)
 	fmt.Println()
 	maxSizeKB := selectMaxFileSize()
 
@@ -93,11 +89,11 @@ func (bs *BellSkipper) Close() error {
 	return nil
 }
 
-func selectDirectoriesInteractive(dirs []string) []string {
-	// Include current directory as an option
-	allDirs := append([]string{"."}, dirs...)
+func selectDirectoriesInteractive(subdirs []string) []string {
+	// ALWAYS include current directory as first option
+	allDirs := []string{"."}
+	allDirs = append(allDirs, subdirs...)
 
-	// Create a multi-select prompt
 	selectedDirs := []string{}
 	label := "Select directories to process (↑↓ to navigate, Enter to toggle selection)"
 
@@ -119,7 +115,7 @@ func selectDirectoriesInteractive(dirs []string) []string {
 			}
 		}
 
-		// Add finish option at the end
+		// Add finish option
 		displayItems = append(displayItems, ">>> FINISH SELECTION <<<")
 
 		prompt := promptui.Select{
@@ -131,7 +127,6 @@ func selectDirectoriesInteractive(dirs []string) []string {
 				Inactive: `  {{ . }}`,
 				Selected: `{{ . }}`,
 			},
-			// IMPORTANT: Removed invalid Keys field to fix compilation error
 		}
 
 		_, result, err := prompt.Run()
@@ -144,7 +139,7 @@ func selectDirectoriesInteractive(dirs []string) []string {
 			return nil
 		}
 
-		// Check if user wants to finish selection
+		// Finish selection
 		if result == ">>> FINISH SELECTION <<<" {
 			if len(selectedDirs) == 0 {
 				fmt.Println("⚠ No directories selected. Continuing anyway...")
@@ -152,7 +147,7 @@ func selectDirectoriesInteractive(dirs []string) []string {
 			break
 		}
 
-		// Extract the actual directory name (remove the checkbox prefix)
+		// Extract actual directory name
 		dirName := strings.TrimPrefix(strings.TrimPrefix(result, "[x] "), "[ ] ")
 
 		// Toggle selection
@@ -165,14 +160,12 @@ func selectDirectoriesInteractive(dirs []string) []string {
 		}
 
 		if foundIndex != -1 {
-			// Remove from selection
 			selectedDirs = append(selectedDirs[:foundIndex], selectedDirs[foundIndex+1:]...)
 		} else {
-			// Add to selection
 			selectedDirs = append(selectedDirs, dirName)
 		}
 
-		// Update label to show current selection count
+		// Update label
 		if len(selectedDirs) > 0 {
 			label = fmt.Sprintf("✓ %d directories selected (↑↓ to navigate, Enter to toggle, choose 'FINISH' when done)", len(selectedDirs))
 		} else {
@@ -206,20 +199,19 @@ func selectExtensions() []string {
 
 	result = strings.TrimSpace(result)
 
-	// Handle wildcard for all file types
+	// Handle wildcard
 	if result == "*" {
 		fmt.Println("✓ Wildcard '*' selected: ALL file types will be included")
-		return []string{} // Empty slice = process all files
+		return []string{}
 	}
 
-	// Process comma-separated extensions
+	// Process extensions
 	extList := strings.Split(result, ",")
 	var extensions []string
 
 	for _, ext := range extList {
 		ext = strings.TrimSpace(ext)
 		if ext != "" {
-			// Ensure extension starts with a dot
 			if !strings.HasPrefix(ext, ".") {
 				ext = "." + ext
 			}
@@ -227,7 +219,7 @@ func selectExtensions() []string {
 		}
 	}
 
-	// Remove duplicates while preserving order
+	// Remove duplicates
 	seen := make(map[string]bool)
 	var resultSlice []string
 	for _, ext := range extensions {
@@ -248,7 +240,7 @@ func selectExtensions() []string {
 func selectMaxFileSize() int64 {
 	prompt := promptui.Prompt{
 		Label:   "Maximum file size to include (in KB, 0 = no limit)",
-		Default: "0",
+		Default: "10", // CHANGED DEFAULT TO 10 KB (safer default)
 		Validate: func(input string) error {
 			size, err := strconv.ParseInt(strings.TrimSpace(input), 10, 64)
 			if err != nil {
@@ -267,20 +259,19 @@ func selectMaxFileSize() int64 {
 			os.Exit(0)
 		}
 		fmt.Printf("Prompt failed: %v\n", err)
-		return 0
+		return 10 // Safe default on error
 	}
 
 	sizeKB, _ := strconv.ParseInt(strings.TrimSpace(result), 10, 64)
-	if sizeKB > 0 {
-		fmt.Printf("✓ Files larger than %d KB will be skipped\n", sizeKB)
-	} else {
+	if sizeKB == 0 {
 		fmt.Println("✓ No size limit (all files will be included)")
+	} else {
+		fmt.Printf("✓ Files larger than %d KB will be skipped\n", sizeKB)
 	}
 	return sizeKB
 }
 
 func processDirectories(dirs []string, extensions []string, maxSizeKB int64, outputFile string) error {
-	// Create or clear the output file
 	outputFileHandle, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("error creating output file: %v", err)
@@ -292,24 +283,34 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 	skippedExt := 0
 	totalSize := int64(0)
 
-	// Process each selected directory
 	for _, dir := range dirs {
 		fmt.Printf("\n📁 Processing directory: %s\n", dir)
 
-		// Walk through the directory tree
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				// Skip inaccessible files/directories
 				fmt.Printf("  ⚠ Skipped (inaccessible): %s\n", path)
 				return nil
 			}
 
-			// Skip directories
 			if info.IsDir() {
+				// Skip node_modules, .git, and other common large directories
+				dirName := info.Name()
+				if dirName == "node_modules" || dirName == ".git" || dirName == "vendor" || dirName == "__pycache__" {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
-			// Check file size limit first (fast check)
+			// Skip hidden files (starting with .) except .gitignore, .env, etc.
+			baseName := filepath.Base(path)
+			if strings.HasPrefix(baseName, ".") && 
+			   baseName != ".gitignore" && 
+			   baseName != ".env" && 
+			   baseName != ".env.example" {
+				return nil
+			}
+
+			// Size check
 			if maxSizeKB > 0 {
 				fileSizeKB := info.Size() / 1024
 				if fileSizeKB > maxSizeKB {
@@ -319,8 +320,8 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 				}
 			}
 
-			// Check file extension
-			shouldProcess := len(extensions) == 0 // Empty = all files
+			// Extension check
+			shouldProcess := len(extensions) == 0
 			if !shouldProcess {
 				ext := strings.ToLower(filepath.Ext(path))
 				for _, allowedExt := range extensions {
@@ -336,14 +337,13 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 				return nil
 			}
 
-			// Read file content
+			// Read and write file
 			content, err := os.ReadFile(path)
 			if err != nil {
 				fmt.Printf("  ⚠ Error reading file %s: %v\n", path, err)
 				return nil
 			}
 
-			// Write header and content to output file
 			header := fmt.Sprintf("// File: %s (%d bytes)\n", path, info.Size())
 			if _, err := outputFileHandle.WriteString(header); err != nil {
 				return err
@@ -366,7 +366,7 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 		}
 	}
 
-	// Print summary
+	// Final summary
 	fmt.Printf("\n" + strings.Repeat("=", 55))
 	fmt.Println("\n✅ ACCUMULATION COMPLETE")
 	fmt.Printf("   Processed files:  %d\n", fileCount)
