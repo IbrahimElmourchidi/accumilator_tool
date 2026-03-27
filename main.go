@@ -15,6 +15,17 @@ func main() {
 	fmt.Println("Accumilator - File Accumulation Tool")
 	fmt.Println("=====================================")
 
+	// Parse --optimize flag
+	optimize := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--optimize" {
+			optimize = true
+		}
+	}
+	if optimize {
+		fmt.Println("Mode: --optimize (output will be split into ≤1 MB chunks)")
+	}
+
 	// Get current working directory
 	currentDir, err := os.Getwd()
 	if err != nil {
@@ -59,14 +70,21 @@ func main() {
 	maxSizeKB := selectMaxFileSize()
 
 	// Process selected directories
-	outputFile := filepath.Join(currentDir, "accumulated_files.txt")
-	err = processDirectories(selectedDirs, extensions, maxSizeKB, outputFile)
+	outputBase := filepath.Join(currentDir, "accumulated_files.txt")
+	outputFiles, err := processDirectories(selectedDirs, extensions, maxSizeKB, outputBase, optimize)
 	if err != nil {
 		fmt.Printf("Error processing directories: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nDone! Combined output saved to: %s\n", outputFile)
+	if len(outputFiles) == 1 {
+		fmt.Printf("\nDone! Combined output saved to: %s\n", outputFiles[0])
+	} else {
+		fmt.Printf("\nDone! Output split into %d files:\n", len(outputFiles))
+		for _, f := range outputFiles {
+			fmt.Printf("  %s\n", f)
+		}
+	}
 }
 
 // BellSkipper implements an io.WriteCloser that skips bell characters
@@ -271,23 +289,25 @@ func selectMaxFileSize() int64 {
 	return sizeKB
 }
 
-func processDirectories(dirs []string, extensions []string, maxSizeKB int64, outputFile string) error {
-	// Resolve absolute path of output file for accurate comparison
-	absOutputFile, err := filepath.Abs(outputFile)
+func processDirectories(dirs []string, extensions []string, maxSizeKB int64, outputBase string, optimize bool) ([]string, error) {
+	const maxOutputBytes = 1 * 1024 * 1024 // 1 MB
+
+	// Resolve absolute path of output base for accurate comparison
+	absOutputBase, err := filepath.Abs(outputBase)
 	if err != nil {
-		return fmt.Errorf("error resolving output file path: %v", err)
+		return nil, fmt.Errorf("error resolving output file path: %v", err)
 	}
 
-	outputFileHandle, err := os.Create(outputFile)
-	if err != nil {
-		return fmt.Errorf("error creating output file: %v", err)
+	// Collect file entries to write
+	type fileEntry struct {
+		chunk []byte
 	}
-	defer outputFileHandle.Close()
+	var entries []fileEntry
 
 	fileCount := 0
 	skippedSize := 0
 	skippedExt := 0
-	skippedOutput := 0 // Track skipped output files
+	skippedOutput := 0
 	totalSize := int64(0)
 
 	for _, dir := range dirs {
@@ -300,7 +320,6 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 			}
 
 			if info.IsDir() {
-				// Skip node_modules, .git, and other common large directories
 				dirName := info.Name()
 				if dirName == "node_modules" || dirName == ".git" || dirName == "vendor" || dirName == "__pycache__" {
 					return filepath.SkipDir
@@ -308,25 +327,26 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 				return nil
 			}
 
-			// EXPLICITLY EXCLUDE accumulated_files.txt (case-insensitive)
+			// EXPLICITLY EXCLUDE accumulated_files*.txt (case-insensitive)
 			baseName := filepath.Base(path)
-			if strings.EqualFold(baseName, "accumulated_files.txt") {
+			absPath, _ := filepath.Abs(path)
+			if strings.EqualFold(baseName, "accumulated_files.txt") || absPath == absOutputBase {
+				skippedOutput++
+				return nil
+			}
+			// Also exclude split output files like accumulated_files_2.txt
+			ext := filepath.Ext(absOutputBase)
+			baseNoExt := strings.TrimSuffix(filepath.Base(absOutputBase), ext)
+			if strings.HasPrefix(strings.ToLower(baseName), strings.ToLower(baseNoExt)+"_") && strings.EqualFold(filepath.Ext(baseName), ext) {
 				skippedOutput++
 				return nil
 			}
 
 			// Skip hidden files (starting with .) except .gitignore, .env, etc.
-			if strings.HasPrefix(baseName, ".") && 
-			   baseName != ".gitignore" && 
-			   baseName != ".env" && 
-			   baseName != ".env.example" {
-				return nil
-			}
-
-			// Skip the output file itself (in case it exists before creation)
-			absPath, _ := filepath.Abs(path)
-			if absPath == absOutputFile {
-				skippedOutput++
+			if strings.HasPrefix(baseName, ".") &&
+				baseName != ".gitignore" &&
+				baseName != ".env" &&
+				baseName != ".env.example" {
 				return nil
 			}
 
@@ -343,9 +363,9 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 			// Extension check
 			shouldProcess := len(extensions) == 0
 			if !shouldProcess {
-				ext := strings.ToLower(filepath.Ext(path))
+				fileExt := strings.ToLower(filepath.Ext(path))
 				for _, allowedExt := range extensions {
-					if ext == allowedExt {
+					if fileExt == allowedExt {
 						shouldProcess = true
 						break
 					}
@@ -357,7 +377,7 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 				return nil
 			}
 
-			// Read and write file
+			// Read file
 			content, err := os.ReadFile(path)
 			if err != nil {
 				fmt.Printf("  ⚠ Error reading file %s: %v\n", path, err)
@@ -365,16 +385,12 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 			}
 
 			header := fmt.Sprintf("// File: %s (%d bytes)\n", path, info.Size())
-			if _, err := outputFileHandle.WriteString(header); err != nil {
-				return err
-			}
-			if _, err := outputFileHandle.Write(content); err != nil {
-				return err
-			}
-			if _, err := outputFileHandle.WriteString("\n\n//------------------------------------------------------------------------------\n\n"); err != nil {
-				return err
-			}
+			separator := "\n\n//------------------------------------------------------------------------------\n\n"
+			chunk := []byte(header)
+			chunk = append(chunk, content...)
+			chunk = append(chunk, []byte(separator)...)
 
+			entries = append(entries, fileEntry{chunk: chunk})
 			fileCount++
 			totalSize += info.Size()
 			fmt.Printf("  ✓ %s (%d KB)\n", path, info.Size()/1024)
@@ -382,7 +398,76 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 		})
 
 		if err != nil {
-			return fmt.Errorf("error walking directory %s: %v", dir, err)
+			return nil, fmt.Errorf("error walking directory %s: %v", dir, err)
+		}
+	}
+
+	// Write output file(s)
+	var outputFiles []string
+
+	if !optimize {
+		// Single file, no splitting
+		f, err := os.Create(outputBase)
+		if err != nil {
+			return nil, fmt.Errorf("error creating output file: %v", err)
+		}
+		for _, e := range entries {
+			if _, err := f.Write(e.chunk); err != nil {
+				f.Close()
+				return nil, err
+			}
+		}
+		f.Close()
+		outputFiles = append(outputFiles, outputBase)
+	} else {
+		// Split into ≤1 MB chunks
+		partNum := 1
+		var currentFile *os.File
+		var currentSize int64
+
+		openNext := func() error {
+			if currentFile != nil {
+				currentFile.Close()
+			}
+			var name string
+			if partNum == 1 {
+				name = outputBase
+			} else {
+				ext := filepath.Ext(outputBase)
+				base := strings.TrimSuffix(outputBase, ext)
+				name = fmt.Sprintf("%s_%d%s", base, partNum, ext)
+			}
+			f, err := os.Create(name)
+			if err != nil {
+				return fmt.Errorf("error creating output file %s: %v", name, err)
+			}
+			outputFiles = append(outputFiles, name)
+			currentFile = f
+			currentSize = 0
+			partNum++
+			return nil
+		}
+
+		if err := openNext(); err != nil {
+			return nil, err
+		}
+
+		for _, e := range entries {
+			chunkLen := int64(len(e.chunk))
+			// If adding this entry would exceed 1 MB and current file is non-empty, start a new file
+			if currentSize > 0 && currentSize+chunkLen > int64(maxOutputBytes) {
+				if err := openNext(); err != nil {
+					return nil, err
+				}
+			}
+			if _, err := currentFile.Write(e.chunk); err != nil {
+				currentFile.Close()
+				return nil, err
+			}
+			currentSize += chunkLen
+		}
+		if currentFile != nil {
+			currentFile.Close()
 		}
 	}
 
@@ -392,9 +477,12 @@ func processDirectories(dirs []string, extensions []string, maxSizeKB int64, out
 	fmt.Printf("   Processed files:    %d\n", fileCount)
 	fmt.Printf("   Skipped (size):     %d\n", skippedSize)
 	fmt.Printf("   Skipped (ext):      %d\n", skippedExt)
-	fmt.Printf("   Skipped (output):   %d\n", skippedOutput) // Show excluded accumulation files
+	fmt.Printf("   Skipped (output):   %d\n", skippedOutput)
 	fmt.Printf("   Total size:         %.2f MB\n", float64(totalSize)/1024/1024)
+	if optimize {
+		fmt.Printf("   Output files:       %d\n", len(outputFiles))
+	}
 	fmt.Println(strings.Repeat("=", 55))
 
-	return nil
+	return outputFiles, nil
 }
